@@ -138,6 +138,14 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
                 }
                 Event::PackageCommitStart(name) => println!("Installing {}...", name),
                 Event::PackageCommitDone(_) => println!("Installing...{}", "Ok".green()),
+                Event::PackageShortcutAddProgress(name) => {
+                    println!("Creating shortcut {}", name)
+                }
+                Event::PackageNotes(notes) => {
+                    for note in notes {
+                        println!("{}", note);
+                    }
+                }
                 Event::PromptPackageCandidate(pkgs) => {
                     let name = pkgs[0].split_once('/').unwrap().1;
                     println!("Found multiple candidates for package '{}':\n", name);

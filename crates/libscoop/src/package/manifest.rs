@@ -880,6 +880,11 @@ impl Manifest {
         self.inner.suggest.as_ref()
     }
 
+    #[inline]
+    pub fn notes(&self) -> Option<Vec<&str>> {
+        self.inner.notes.as_ref().map(|v| v.devectorize())
+    }
+
     pub fn pre_install(&self) -> Option<Vec<&str>> {
         let ret = arch_specific_field!(self, pre_install);
         ret.map(|v| v.devectorize())

@@ -4,11 +4,11 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
-    constant::REGEX_HASH, error::Fallible, internal, persist, psmodule, shim, shortcut, Error,
-    Event, QueryOption, Session,
+    constant::REGEX_HASH, env, error::Fallible, internal, persist, psmodule, script, shim,
+    shortcut, Error, Event, QueryOption, Session,
 };
 
 use super::{
@@ -431,6 +431,9 @@ pub fn install(session: &Session, queries: &[&str], options: &[SyncOption]) -> F
     if packages.is_empty() {
         return Ok(());
     }
+    for package in &packages {
+        validate_install_manifest(package)?;
+    }
 
     let mut set = download::PackageSet::new(session, &packages, reuse_cache)?;
 
@@ -547,7 +550,15 @@ pub fn install(session: &Session, queries: &[&str], options: &[SyncOption]) -> F
                 let _ = tx.send(Event::PackageCommitStart(package.name().to_owned()));
             }
 
-            commit_package(session, package)?;
+            let command = if transaction
+                .install_view()
+                .is_some_and(|items| items.iter().any(|item| item == package))
+            {
+                "install"
+            } else {
+                "update"
+            };
+            commit_package(session, package, command)?;
 
             if let Some(tx) = session.emitter() {
                 let _ = tx.send(Event::PackageCommitDone(package.name().to_owned()));
@@ -558,7 +569,30 @@ pub fn install(session: &Session, queries: &[&str], options: &[SyncOption]) -> F
     Ok(())
 }
 
-fn commit_package(session: &Session, package: &Package) -> Fallible<()> {
+fn validate_install_manifest(package: &Package) -> Fallible<()> {
+    let manifest = package.manifest();
+    let unsupported = if manifest.innosetup() {
+        Some("innosetup")
+    } else if manifest.psmodule().is_some() {
+        Some("psmodule")
+    } else if manifest.installer().is_some() {
+        Some("installer")
+    } else if manifest.uninstaller().is_some() {
+        Some("uninstaller")
+    } else {
+        None
+    };
+
+    match unsupported {
+        Some(field) => Err(Error::Custom(format!(
+            "manifest field '{field}' is not supported for installing '{}'",
+            package.name()
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn commit_package(session: &Session, package: &Package, command: &str) -> Fallible<()> {
     let (root, cache, no_junction) = {
         let config = session.config();
         (
@@ -599,109 +633,40 @@ fn commit_package(session: &Session, package: &Package) -> Fallible<()> {
     }
     std::fs::rename(&stage_dir, &version_dir)?;
 
+    let context = script::HookContext::new(session, package, command)?;
+    let mut pre_install_context = context.clone();
+    pre_install_context.dir = version_dir.clone();
+    if let Err(error) = script::run_hook(
+        session,
+        package,
+        script::Hook::PreInstall,
+        &pre_install_context,
+    ) {
+        let _ = internal::fs::remove_dir(&version_dir);
+        return Err(error);
+    }
+
     if !no_junction {
         internal::fs::symlink_dir(&version_dir, app_dir.join("current"))?;
     }
 
-    persist::link(session, package)?;
-    let portable_hooks_applied = apply_portable_install_hooks(session, package)?;
     shim::add(session, package)?;
+    shortcut::add(session, package, &context)?;
+    env::add(session, package, &context)?;
+    persist::link(session, package)?;
+    script::run_hook(session, package, script::Hook::PostInstall, &context)?;
 
-    if package.has_install_script() && !portable_hooks_applied {
-        warn!(
-            "PowerShell install hooks for '{}' were not executed",
-            package.name()
-        );
+    if let Some(notes) = package.manifest().notes() {
+        if let Some(tx) = session.emitter() {
+            let notes = notes
+                .into_iter()
+                .map(|note| context.expand(note, package))
+                .collect();
+            let _ = tx.send(Event::PackageNotes(notes));
+        }
     }
 
     Ok(())
-}
-
-fn apply_portable_install_hooks(session: &Session, package: &Package) -> Fallible<bool> {
-    if package.manifest().pre_install().is_some()
-        || package
-            .manifest()
-            .installer()
-            .and_then(|installer| installer.script())
-            .is_some()
-    {
-        return Ok(false);
-    }
-
-    let hooks = match package.manifest().post_install() {
-        Some(hooks) => hooks,
-        None => return Ok(false),
-    };
-    let (app_dir, persist_dir) = {
-        let config = session.config();
-        let version = if config.no_junction() {
-            package.version()
-        } else {
-            "current"
-        };
-        (
-            config
-                .root_path()
-                .join("apps")
-                .join(package.name())
-                .join(version),
-            config.root_path().join("persist").join(package.name()),
-        )
-    };
-    let mut writes = Vec::new();
-
-    for hook in hooks {
-        let hook = hook.trim();
-        if hook.is_empty() || hook.starts_with('#') {
-            continue;
-        }
-        let body = match hook.strip_prefix("Set-Content -Value \"") {
-            Some(body) => body,
-            None => return Ok(false),
-        };
-        let (value, path) = match body.split_once("\" -Path \"") {
-            Some(parts) => parts,
-            None => return Ok(false),
-        };
-        let path = match path.strip_suffix('"') {
-            Some(path) => path,
-            None => return Ok(false),
-        };
-        let value = expand_hook_value(value, &app_dir, &persist_dir, package.version());
-        let path = PathBuf::from(expand_hook_value(
-            path,
-            &app_dir,
-            &persist_dir,
-            package.version(),
-        ));
-        let path = internal::path::normalize_path(path);
-        if !path.starts_with(&app_dir) && !path.starts_with(&persist_dir) {
-            return Err(Error::Custom(format!(
-                "install hook attempted to write outside package directories: '{}'",
-                path.display()
-            )));
-        }
-        writes.push((path, value));
-    }
-
-    for (path, value) in writes {
-        if let Some(parent) = path.parent() {
-            internal::fs::ensure_dir(parent)?;
-        }
-        std::fs::write(path, value)?;
-    }
-
-    Ok(true)
-}
-
-fn expand_hook_value(value: &str, app_dir: &Path, persist_dir: &Path, version: &str) -> String {
-    value
-        .replace("$persist_dir", &persist_dir.to_string_lossy())
-        .replace("$dir", &app_dir.to_string_lossy())
-        .replace("$version", version)
-        .replace("`r", "\r")
-        .replace("`n", "\n")
-        .replace("``", "`")
 }
 
 fn prepare_package_payload(package: &Package, cache: &Path, stage: &Path) -> Fallible<()> {
@@ -876,17 +841,13 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
 
     let transaction = Transaction::default();
 
-    // TODO: PowerShell hosting with execution context is not supported yet.
-    // Perhaps at present we could call Scoop to do the removal for packages
-    // using PS scripts...
-    let (packages_with_script, _packages): (Vec<_>, Vec<_>) =
-        packages.iter().partition(|p| p.has_uninstall_script());
-
-    // TODO: support removal of packages with PowerShell script
-    if !packages_with_script.is_empty() {
-        let msg = format!("Found package(s) using PowerShell script:\n  {}\nRemoval of package with PowerShell script is not yet supported.",
-        packages_with_script.iter().map(|p| p.name()).collect::<Vec<_>>().join("  "));
-        return Err(Error::Custom(msg));
+    for package in &packages {
+        if package.manifest().uninstaller().is_some() {
+            return Err(Error::Custom(format!(
+                "manifest field 'uninstaller' is not supported for uninstalling '{}'",
+                package.name()
+            )));
+        }
     }
 
     transaction.set_remove(packages);
@@ -917,8 +878,7 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
 
     if let Some(packages) = transaction.remove_view() {
         let purge = options.contains(&SyncOption::Purge);
-        let config = session.config();
-        let root_dir = config.root_path();
+        let root_dir = session.config().root_path().to_owned();
 
         for package in packages.iter() {
             if let Some(tx) = session.emitter() {
@@ -926,30 +886,30 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
             }
 
             let app_dir = root_dir.join("apps").join(package.name());
-
-            // TODO: pre_uninstall
-            // TODO: uninstaller
+            let context = script::HookContext::new(session, package, "uninstall")?;
+            script::run_hook(session, package, script::Hook::PreUninstall, &context)?;
 
             shim::remove(session, package)?;
             shortcut::remove(session, package)?;
             psmodule::remove(session, package)?;
+            env::remove(session, package)?;
             persist::unlink(session, package)?;
 
             let current_lnk = app_dir.join("current");
             internal::fs::remove_symlink(current_lnk)?;
+            internal::fs::remove_dir(&app_dir)?;
 
-            // TODO: post_uninstall
-
-            // Remove the app directory
-            internal::fs::remove_dir(app_dir)?;
+            script::run_hook(session, package, script::Hook::PostUninstall, &context)?;
 
             if purge {
                 if let Some(tx) = session.emitter() {
                     let _ = tx.send(Event::PackagePersistPurgeStart);
                 }
 
-                let persist_dir = config.root_path().join("persist").join(package.name());
-                internal::fs::remove_dir(persist_dir)?;
+                let persist_dir = root_dir.join("persist").join(package.name());
+                if persist_dir.exists() {
+                    internal::fs::remove_dir(persist_dir)?;
+                }
 
                 if let Some(tx) = session.emitter() {
                     let _ = tx.send(Event::PackagePersistPurgeDone);

@@ -43,6 +43,7 @@ mod internal;
 mod package;
 mod persist;
 mod psmodule;
+mod script;
 mod session;
 mod shim;
 mod shortcut;

@@ -970,6 +970,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tracing",
+ "windows-sys 0.52.0",
  "winreg",
  "zip",
 ]

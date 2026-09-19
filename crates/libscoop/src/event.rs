@@ -141,6 +141,15 @@ pub enum Event {
     /// Package shim removal has finished.
     PackageShimRemoveDone,
 
+    /// Package shortcut creation has started.
+    PackageShortcutAddStart,
+
+    /// Package shortcut creation has made some progress.
+    PackageShortcutAddProgress(String),
+
+    /// Package shortcut creation has finished.
+    PackageShortcutAddDone,
+
     /// Package shortcut removal has started.
     PackageShortcutRemoveStart,
 
@@ -149,6 +158,9 @@ pub enum Event {
 
     /// Package shortcut removal has finished.
     PackageShortcutRemoveDone,
+
+    /// Package installation notes should be displayed.
+    PackageNotes(Vec<String>),
 
     /// Package sync operation has finished.
     PackageSyncDone,

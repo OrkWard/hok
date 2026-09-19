@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::error::Fallible;
 
 #[cfg(unix)]
-pub use unix::{get, set};
+pub use unix::{broadcast, get, set};
 #[cfg(windows)]
-pub use windows::{get, set};
+pub use windows::{broadcast, get, set};
 
 /// Get the value of a path-like environment variable.
 pub fn get_path_like_env(name: &str) -> Fallible<Vec<PathBuf>> {
@@ -17,7 +17,11 @@ pub fn get_path_like_env(name: &str) -> Fallible<Vec<PathBuf>> {
 mod windows {
     use once_cell::sync::Lazy;
     use std::ffi::OsString;
+    use std::io;
     use std::path::Path;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+    };
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
@@ -31,7 +35,11 @@ mod windows {
     pub fn get(key: &str) -> Fallible<OsString> {
         let path = Path::new("Environment");
         let env = HKCU.open_subkey(path)?;
-        Ok(env.get_value(key)?)
+        match env.get_value(key) {
+            Ok(value) => Ok(value),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(OsString::new()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Set the value of an environment variable.
@@ -48,6 +56,23 @@ mod windows {
             }
         }
         Ok(())
+    }
+
+    /// Notify running Windows applications that the user environment changed.
+    pub fn broadcast() {
+        let environment = "Environment\0".encode_utf16().collect::<Vec<_>>();
+        let mut result = 0usize;
+        unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                environment.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                5_000,
+                &mut result,
+            );
+        }
     }
 }
 
@@ -69,4 +94,6 @@ mod unix {
         // no-op
         Ok(())
     }
+
+    pub fn broadcast() {}
 }
