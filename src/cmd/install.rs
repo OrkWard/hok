@@ -136,6 +136,8 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
                         .unwrap();
                     println!("Checking package integrity...{}", "Ok".green());
                 }
+                Event::PackageCommitStart(name) => println!("Installing {}...", name),
+                Event::PackageCommitDone(_) => println!("Installing...{}", "Ok".green()),
                 Event::PromptPackageCandidate(pkgs) => {
                     let name = pkgs[0].split_once('/').unwrap().1;
                     println!("Found multiple candidates for package '{}':\n", name);
@@ -261,6 +263,5 @@ pub fn execute(args: Args, session: &Session) -> Result<()> {
     let mut stdout = std::io::stdout();
     let _ = stdout.execute(cursor::Show);
 
-    eprintln!("Not implemented yet.");
     Ok(())
 }

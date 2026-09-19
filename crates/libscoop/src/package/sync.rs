@@ -1,16 +1,19 @@
 use once_cell::unsync::OnceCell;
 use scoop_hash::ChecksumBuilder;
-use std::io::Read;
-use tracing::{debug, info};
+use std::{
+    io::Read,
+    path::{Component, Path, PathBuf},
+};
+use tracing::{debug, info, warn};
 
 use crate::{
-    constant::REGEX_HASH, env, error::Fallible, internal, persist, psmodule, shim, shortcut, Error,
+    constant::REGEX_HASH, error::Fallible, internal, persist, psmodule, shim, shortcut, Error,
     Event, QueryOption, Session,
 };
 
 use super::{
     download::{self, DownloadSize},
-    query, resolve, Package,
+    query, resolve, InstallInfo, Package,
 };
 
 /// Options that may be used to tweak behavior of package sync operation.
@@ -539,39 +542,257 @@ pub fn install(session: &Session, queries: &[&str], options: &[SyncOption]) -> F
 
     let download_only = options.contains(&SyncOption::DownloadOnly);
     if !download_only {
-        // TODO: PowerShell hosting with execution context is not supported yet.
-        // Perhaps at present we could call Scoop to do the removal for packages
-        // using PS scripts...
-        let (_packages_with_script, _packages): (Vec<&Package>, Vec<&Package>) =
-            packages.iter().partition(|p| p.has_install_script());
+        for package in packages {
+            if let Some(tx) = session.emitter() {
+                let _ = tx.send(Event::PackageCommitStart(package.name().to_owned()));
+            }
 
-        // TODO: commit transcation
-        // let config = session.config();
-        // let apps_dir = config.root_path().join("apps");
+            commit_package(session, package)?;
 
-        // for &pkg in packages.iter() {
-        //     if let Some(tx) = session.emitter() {
-        //         let _ = tx.send(Event::PackageCommitStart(pkg.name().to_owned()));
-        //     }
-
-        //     let working_dir = apps_dir.join(pkg.name()).join(pkg.version());
-        //     internal::fs::ensure_dir(&working_dir)?;
-
-        //     let files = pkg.download_filenames();
-
-        //     for filename in files.iter() {
-        //         let src = config.cache_path().join(filename);
-        //         let dst = working_dir.join(filename);
-
-        //         // replace existing file
-        //         let _ = std::fs::remove_file(&dst);
-        //         std::fs::copy(src, dst)?;
-
-        //     }
-        // }
+            if let Some(tx) = session.emitter() {
+                let _ = tx.send(Event::PackageCommitDone(package.name().to_owned()));
+            }
+        }
     }
 
     Ok(())
+}
+
+fn commit_package(session: &Session, package: &Package) -> Fallible<()> {
+    let (root, cache, no_junction) = {
+        let config = session.config();
+        (
+            config.root_path().to_owned(),
+            config.cache_path().to_owned(),
+            config.no_junction(),
+        )
+    };
+    let app_dir = root.join("apps").join(package.name());
+    let version_dir = app_dir.join(package.version());
+    let stage_dir = app_dir.join(format!(
+        ".hok-stage-{}",
+        internal::fs::filenamify(package.version())
+    ));
+
+    if stage_dir.exists() {
+        internal::fs::remove_dir(&stage_dir)?;
+    }
+    internal::fs::ensure_dir(&stage_dir)?;
+
+    let prepared = prepare_package_payload(package, &cache, &stage_dir).and_then(|_| {
+        std::fs::copy(package.manifest().path(), stage_dir.join("manifest.json"))?;
+        let install_info = InstallInfo::new(
+            current_architecture(),
+            Some(package.bucket()),
+            package.is_held(),
+        );
+        internal::fs::write_json(stage_dir.join("install.json"), install_info)
+    });
+
+    if let Err(error) = prepared {
+        let _ = internal::fs::remove_dir(&stage_dir);
+        return Err(error);
+    }
+
+    if version_dir.exists() {
+        internal::fs::remove_dir(&version_dir)?;
+    }
+    std::fs::rename(&stage_dir, &version_dir)?;
+
+    if !no_junction {
+        internal::fs::symlink_dir(&version_dir, app_dir.join("current"))?;
+    }
+
+    persist::link(session, package)?;
+    let portable_hooks_applied = apply_portable_install_hooks(session, package)?;
+    shim::add(session, package)?;
+
+    if package.has_install_script() && !portable_hooks_applied {
+        warn!(
+            "PowerShell install hooks for '{}' were not executed",
+            package.name()
+        );
+    }
+
+    Ok(())
+}
+
+fn apply_portable_install_hooks(session: &Session, package: &Package) -> Fallible<bool> {
+    if package.manifest().pre_install().is_some()
+        || package
+            .manifest()
+            .installer()
+            .and_then(|installer| installer.script())
+            .is_some()
+    {
+        return Ok(false);
+    }
+
+    let hooks = match package.manifest().post_install() {
+        Some(hooks) => hooks,
+        None => return Ok(false),
+    };
+    let (app_dir, persist_dir) = {
+        let config = session.config();
+        let version = if config.no_junction() {
+            package.version()
+        } else {
+            "current"
+        };
+        (
+            config
+                .root_path()
+                .join("apps")
+                .join(package.name())
+                .join(version),
+            config.root_path().join("persist").join(package.name()),
+        )
+    };
+    let mut writes = Vec::new();
+
+    for hook in hooks {
+        let hook = hook.trim();
+        if hook.is_empty() || hook.starts_with('#') {
+            continue;
+        }
+        let body = match hook.strip_prefix("Set-Content -Value \"") {
+            Some(body) => body,
+            None => return Ok(false),
+        };
+        let (value, path) = match body.split_once("\" -Path \"") {
+            Some(parts) => parts,
+            None => return Ok(false),
+        };
+        let path = match path.strip_suffix('"') {
+            Some(path) => path,
+            None => return Ok(false),
+        };
+        let value = expand_hook_value(value, &app_dir, &persist_dir, package.version());
+        let path = PathBuf::from(expand_hook_value(
+            path,
+            &app_dir,
+            &persist_dir,
+            package.version(),
+        ));
+        let path = internal::path::normalize_path(path);
+        if !path.starts_with(&app_dir) && !path.starts_with(&persist_dir) {
+            return Err(Error::Custom(format!(
+                "install hook attempted to write outside package directories: '{}'",
+                path.display()
+            )));
+        }
+        writes.push((path, value));
+    }
+
+    for (path, value) in writes {
+        if let Some(parent) = path.parent() {
+            internal::fs::ensure_dir(parent)?;
+        }
+        std::fs::write(path, value)?;
+    }
+
+    Ok(true)
+}
+
+fn expand_hook_value(value: &str, app_dir: &Path, persist_dir: &Path, version: &str) -> String {
+    value
+        .replace("$persist_dir", &persist_dir.to_string_lossy())
+        .replace("$dir", &app_dir.to_string_lossy())
+        .replace("$version", version)
+        .replace("`r", "\r")
+        .replace("`n", "\n")
+        .replace("``", "`")
+}
+
+fn prepare_package_payload(package: &Package, cache: &Path, stage: &Path) -> Fallible<()> {
+    let cache_files = package.download_filenames();
+    let urls = package.manifest().url();
+    let extract_dirs = package.manifest().extract_dir().unwrap_or_default();
+    let extract_targets = package.manifest().extract_to().unwrap_or_default();
+
+    for (index, (cache_file, url)) in cache_files.iter().zip(urls.iter()).enumerate() {
+        let source = cache.join(cache_file);
+        let target = select_value(&extract_targets, index)
+            .map(|path| safe_destination(stage, path))
+            .transpose()?
+            .unwrap_or_else(|| stage.to_owned());
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        match extension.as_str() {
+            "7z" => {
+                internal::archive::extract_7z(&source, &target, select_value(&extract_dirs, index))?
+            }
+            "zip" => internal::archive::extract_zip(
+                &source,
+                &target,
+                select_value(&extract_dirs, index),
+            )?,
+            "lzma" => internal::archive::extract_tar_lzma(
+                &source,
+                &target,
+                select_value(&extract_dirs, index),
+            )?,
+            _ => {
+                internal::fs::ensure_dir(&target)?;
+                std::fs::copy(&source, target.join(artifact_name(url)?))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn select_value<'a>(values: &'a [&'a str], index: usize) -> Option<&'a str> {
+    values
+        .get(index)
+        .copied()
+        .or_else(|| (values.len() == 1).then(|| values[0]))
+}
+
+fn safe_destination(base: &Path, relative: &str) -> Fallible<PathBuf> {
+    let path = Path::new(relative);
+    let unsafe_path = path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    });
+    if unsafe_path {
+        return Err(Error::Custom(format!(
+            "unsafe extraction destination '{relative}'"
+        )));
+    }
+    Ok(base.join(path))
+}
+
+fn artifact_name(url: &str) -> Fallible<&str> {
+    if let Some((_, fragment)) = url.split_once('#') {
+        let name = fragment.trim_start_matches('/');
+        if !name.is_empty() {
+            return Ok(name.rsplit('/').next().unwrap());
+        }
+    }
+
+    let clean = url.split(['?', '#']).next().unwrap_or(url);
+    clean
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::Custom(format!("could not determine filename from '{url}'")))
+}
+
+fn current_architecture() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "64bit"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "32bit"
+    }
 }
 
 /// Sync operation: remove packages.
@@ -712,7 +933,6 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
             shim::remove(session, package)?;
             shortcut::remove(session, package)?;
             psmodule::remove(session, package)?;
-            env::remove(session, package)?;
             persist::unlink(session, package)?;
 
             let current_lnk = app_dir.join("current");

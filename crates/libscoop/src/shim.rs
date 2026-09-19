@@ -51,7 +51,7 @@ pub enum ShimType {
 }
 
 impl Shim<'_> {
-    pub fn new(def: Vec<&str>) -> Shim {
+    pub fn new(def: Vec<&str>) -> Shim<'_> {
         let length = def.len();
         assert_ne!(length, 0);
 
@@ -90,16 +90,76 @@ impl Shim<'_> {
     }
 }
 
-// pub fn add(session: &Session, package: &Package) -> Fallible<()> {
-//     let config = session.config();
-//     let shims_dir = config.root_path().join("shims");
+pub fn add(session: &Session, package: &Package) -> Fallible<()> {
+    let config = session.config();
+    let shims_dir = config.root_path().join("shims");
+    internal::fs::ensure_dir(&shims_dir)?;
 
-//     if let Some(bins) = package.manifest().bin() {
-//         // TODO
-//     }
+    if let Some(bins) = package.manifest().bin() {
+        let version = if config.no_junction() {
+            package.version()
+        } else {
+            "current"
+        };
+        let app_dir = config
+            .root_path()
+            .join("apps")
+            .join(package.name())
+            .join(version);
 
-//     Ok(())
-// }
+        for shim in bins.into_iter().map(Shim::new) {
+            let target = app_dir.join(shim.real_name);
+            if !target.is_file() {
+                return Err(crate::Error::Custom(format!(
+                    "shim target '{}' does not exist",
+                    target.display()
+                )));
+            }
+
+            let args = shim.args.as_deref().unwrap_or_default();
+            let shell_shim = shims_dir.join(shim.name);
+            let mut executable_shim = shell_shim.clone();
+            executable_shim.set_extension("exe");
+            let _ = std::fs::remove_file(executable_shim);
+
+            // Launch the target instead of linking the executable into the shim
+            // directory. Windows resolves adjacent DLLs relative to the path used
+            // to start the executable, so a hard-link shim can break dependencies.
+            let shell_target = target.to_string_lossy().replace('\\', "/");
+            let shell_args = args
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let separator = if shell_args.is_empty() { "" } else { " " };
+            let script = format!(
+                "#!/bin/sh\nexec {}{}{} \"$@\"\n",
+                shell_quote(&shell_target),
+                separator,
+                shell_args
+            );
+            std::fs::write(shell_shim, script)?;
+
+            let mut command_shim = shims_dir.join(shim.name);
+            command_shim.set_extension("cmd");
+            let args = args.join(" ");
+            let separator = if args.is_empty() { "" } else { " " };
+            let script = format!(
+                "@echo off\r\n\"{}\"{}{} %*\r\n",
+                target.display(),
+                separator,
+                args
+            );
+            std::fs::write(command_shim, script)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
 
 /// Remove shims for a package.
 pub fn remove(session: &Session, package: &Package) -> Fallible<()> {
@@ -110,10 +170,6 @@ pub fn remove(session: &Session, package: &Package) -> Fallible<()> {
 
     if let Some(bins) = package.manifest().bin() {
         let pkg_name = package.name();
-        let shims_dir_entries = shims_dir
-            .read_dir()?
-            .filter_map(Result::ok)
-            .collect::<Vec<_>>();
 
         if let Some(tx) = session.emitter() {
             let _ = tx.send(Event::PackageShimRemoveStart);
@@ -122,7 +178,7 @@ pub fn remove(session: &Session, package: &Package) -> Fallible<()> {
         for shim in bins.into_iter().map(Shim::new) {
             let mut shim_path = shims_dir.join(shim.name);
             let exts = match shim.ty {
-                ShimType::Exe => vec!["exe", "shim"],
+                ShimType::Exe => vec!["exe", "shim", "cmd", ""],
                 ShimType::PowerShell => vec!["cmd", "ps1", ""],
                 _ => vec!["cmd", ""],
             };
@@ -156,17 +212,13 @@ pub fn remove(session: &Session, package: &Package) -> Fallible<()> {
 
                     // restore alter shim
                     let fname = shim_path.file_name().unwrap().to_str().unwrap();
-                    let mut alt_shims = shims_dir_entries
-                        .iter()
-                        .flat_map(|entry| {
+                    let mut alt_shims = shims_dir
+                        .read_dir()?
+                        .filter_map(Result::ok)
+                        .filter(|entry| {
                             let path = entry.path();
-                            let name = path.file_name().unwrap().to_str().unwrap();
-
-                            if name.starts_with(fname) && name != fname {
-                                Some(entry)
-                            } else {
-                                None
-                            }
+                            let name = path.file_name().unwrap().to_string_lossy();
+                            name.starts_with(fname) && name != fname
                         })
                         .collect::<Vec<_>>();
 
