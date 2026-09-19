@@ -14,6 +14,7 @@ pub(crate) enum Hook {
     PreInstall,
     PostInstall,
     PreUninstall,
+    Uninstaller,
     PostUninstall,
 }
 
@@ -23,6 +24,7 @@ impl Hook {
             Self::PreInstall => "pre_install",
             Self::PostInstall => "post_install",
             Self::PreUninstall => "pre_uninstall",
+            Self::Uninstaller => "uninstaller",
             Self::PostUninstall => "post_uninstall",
         }
     }
@@ -101,6 +103,7 @@ impl HookContext {
 
         Ok(vec![
             ("HOK_APP".into(), package.name().into()),
+            ("HOK_BUCKET".into(), package.bucket().into()),
             ("HOK_VERSION".into(), package.version().into()),
             ("HOK_ARCHITECTURE".into(), self.architecture.clone().into()),
             ("HOK_COMMAND".into(), self.command.clone().into()),
@@ -147,6 +150,10 @@ pub(crate) fn run_hook(
         Hook::PreInstall => package.manifest().pre_install(),
         Hook::PostInstall => package.manifest().post_install(),
         Hook::PreUninstall => package.manifest().pre_uninstall(),
+        Hook::Uninstaller => package
+            .manifest()
+            .uninstaller()
+            .and_then(|value| value.script()),
         Hook::PostUninstall => package.manifest().post_uninstall(),
     };
     let Some(lines) = lines else {
@@ -157,6 +164,12 @@ pub(crate) fn run_hook(
     source.push_str("\r\n$manifest = '");
     source.push_str(&context.manifest_json.replace('\'', "''"));
     source.push_str("' | ConvertFrom-Json\r\n");
+    if matches!(hook, Hook::Uninstaller) {
+        // Scoop runs uninstaller scripts with PowerShell's default non-terminating
+        // error behavior. This also prevents successful native tools that write
+        // status messages to stderr (notably reg.exe) from aborting the script.
+        source.push_str("$ErrorActionPreference = 'Continue'\r\n");
+    }
     source.push_str(&lines.join("\r\n"));
     source.push_str("\r\n");
 
@@ -246,13 +259,22 @@ fn current_architecture() -> &'static str {
 }
 
 #[cfg(windows)]
-fn powershell_executable() -> &'static str {
-    "powershell.exe"
+fn powershell_executable() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|path| {
+            path.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("powershell.exe"))
 }
 
 #[cfg(not(windows))]
-fn powershell_executable() -> &'static str {
-    "pwsh"
+fn powershell_executable() -> PathBuf {
+    PathBuf::from("pwsh")
 }
 
 const POWERSHELL_PRELUDE: &str = r#"$ErrorActionPreference = 'Stop'
@@ -261,6 +283,7 @@ $ProgressPreference = 'SilentlyContinue'
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $app = $env:HOK_APP
+$bucket = $env:HOK_BUCKET
 $version = $env:HOK_VERSION
 $architecture = $env:HOK_ARCHITECTURE
 $cmd = $env:HOK_COMMAND
@@ -333,6 +356,7 @@ mod tests {
         let missing_config = temp.join("hok-missing-config.json");
         let environment = vec![
             ("HOK_APP".into(), OsString::from("test-app")),
+            ("HOK_BUCKET".into(), OsString::from("main")),
             ("HOK_VERSION".into(), OsString::from("1.0.0")),
             ("HOK_ARCHITECTURE".into(), OsString::from("64bit")),
             ("HOK_COMMAND".into(), OsString::from("install")),
@@ -349,7 +373,7 @@ mod tests {
             ("HOK_FILENAMES".into(), OsString::from("[\"test.zip\"]")),
         ];
         let source = format!(
-            "{POWERSHELL_PRELUDE}\r\n$manifest = '{{}}' | ConvertFrom-Json\r\nif ($app -ne 'test-app' -or $fname -ne 'test.zip' -or $global) {{ exit 7 }}"
+            "{POWERSHELL_PRELUDE}\r\n$manifest = '{{}}' | ConvertFrom-Json\r\nif ($app -ne 'test-app' -or $bucket -ne 'main' -or $fname -ne 'test.zip' -or $global) {{ exit 7 }}"
         );
 
         run_powershell("prelude-test", &source, &environment).unwrap();

@@ -577,10 +577,8 @@ fn validate_install_manifest(package: &Package) -> Fallible<()> {
         Some("psmodule")
     } else if manifest.installer().is_some() {
         Some("installer")
-    } else if manifest.uninstaller().is_some() {
-        Some("uninstaller")
     } else {
-        None
+        unsupported_uninstaller_field(package)
     };
 
     match unsupported {
@@ -590,6 +588,18 @@ fn validate_install_manifest(package: &Package) -> Fallible<()> {
         ))),
         None => Ok(()),
     }
+}
+
+fn unsupported_uninstaller_field(package: &Package) -> Option<&'static str> {
+    package.manifest().uninstaller().and_then(|uninstaller| {
+        if uninstaller.file().is_some() {
+            Some("uninstaller.file")
+        } else if uninstaller.args().is_some() {
+            Some("uninstaller.args")
+        } else {
+            None
+        }
+    })
 }
 
 fn commit_package(session: &Session, package: &Package, command: &str) -> Fallible<()> {
@@ -842,9 +852,9 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
     let transaction = Transaction::default();
 
     for package in &packages {
-        if package.manifest().uninstaller().is_some() {
+        if let Some(field) = unsupported_uninstaller_field(package) {
             return Err(Error::Custom(format!(
-                "manifest field 'uninstaller' is not supported for uninstalling '{}'",
+                "manifest field '{field}' is not supported for uninstalling '{}'",
                 package.name()
             )));
         }
@@ -888,6 +898,7 @@ pub fn remove(session: &Session, queries: &[&str], options: &[SyncOption]) -> Fa
             let app_dir = root_dir.join("apps").join(package.name());
             let context = script::HookContext::new(session, package, "uninstall")?;
             script::run_hook(session, package, script::Hook::PreUninstall, &context)?;
+            script::run_hook(session, package, script::Hook::Uninstaller, &context)?;
 
             shim::remove(session, package)?;
             shortcut::remove(session, package)?;
